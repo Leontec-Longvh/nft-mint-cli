@@ -12,67 +12,97 @@ import { OpenSeaClient, type MintStage } from "./opensea.js";
 import { broadcastRace, warmUp } from "./broadcast.js";
 import { config } from "./config.js";
 
-function elapsed(startedAt: number): string {
-  return `${Math.round(performance.now() - startedAt)}ms`;
-}
+/*
+ * ============================================================
+ * V7-A3 SPEED / BEAST MODE
+ * ============================================================
+ *
+ * OBJECTIVE:
+ *   Maximum FCFS speed with minimum unnecessary RPC/API calls.
+ *
+ * CORE RULES:
+ *
+ * 1. /drops/{slug}
+ *      -> fetch ONCE at startup
+ *
+ * 2. PREP
+ *      -> nonce + fee ONCE
+ *      -> NEVER re-PREP after phase changes / 409 / 422
+ *
+ * 3. gas
+ *      -> fixed --gas-limit recommended
+ *      -> no estimateGas when fixed gas is supplied
+ *
+ * 4. FUTURE PHASE
+ *      -> sleep silently until T-5s
+ *
+ * 5. T-5s HOT WINDOW
+ *      -> aggressive /mint probing
+ *
+ * 6. 409
+ *      -> drop/phase not active yet
+ *      -> retry /mint
+ *      -> DO NOT refresh /drops
+ *      -> DO NOT re-PREP
+ *
+ * 7. 422
+ *      -> ONLY skip the phase if that phase is already ACTIVE
+ *
+ *      -> if target phase is still FUTURE:
+ *           DO NOT blacklist it
+ *           because /mint is probing the currently active phase
+ *
+ * 8. 200
+ *      -> calldata obtained
+ *      -> sign immediately
+ *      -> broadcast to all RPCs
+ *
+ * 9. No polling logs.
+ *      -> one WAIT log
+ *      -> one HOT log
+ *      -> only meaningful probe events
+ *
+ * 10. Single-flight probing.
+ *      -> never create overlapping /mint requests
+ *
+ * ============================================================
+ */
 
 /*
  * ============================================================
- * RPC RESILIENCE
+ * TIMING
  * ============================================================
- *
- * A single flaky/slow RPC must never hard-fail the whole run.
- * Every read call (nonce, fee data, gas estimate) is raced across
- * ALL configured RPCs — same idea already used for broadcasting.
- * Whichever RPC answers first wins; the others are ignored.
  */
-const RPC_TIMEOUT_MS = 8_000;
-const RPC_RETRY_COUNT = 2;
-const RPC_RETRY_DELAY_MS = 200;
 
-function createClients(chain: Chain, rpcUrls: string[]): PublicClient[] {
-  return rpcUrls.map((url) =>
-    createPublicClient({
-      chain,
-      transport: http(url, {
-        timeout: RPC_TIMEOUT_MS,
-        retryCount: RPC_RETRY_COUNT,
-        retryDelay: RPC_RETRY_DELAY_MS,
-      }),
-    }),
-  );
-}
+const HOT_WINDOW_MS = 5_000;
 
-async function raceAny<T>(clients: PublicClient[], fn: (client: PublicClient) => Promise<T>): Promise<T> {
-  try {
-    return await Promise.any(clients.map((client) => fn(client)));
-  } catch (error) {
-    const messages =
-      error instanceof AggregateError
-        ? error.errors.map((e) => (e instanceof Error ? e.message : String(e)))
-        : [String(error)];
-    throw new Error(["All RPCs failed for this call.", ...messages].join("\n"));
-  }
-}
+// Before T-2s: enough to detect transition without hammering OpenSea.
+const PROBE_INTERVAL_NORMAL_MS = 500;
+
+// T-2s -> T-500ms.
+const PROBE_INTERVAL_FAST_MS = 250;
+
+// Final 500ms.
+const PROBE_INTERVAL_FINAL_MS = 100;
+
+// Small safety delay after a 409.
+const RETRY_409_MIN_MS = 80;
 
 /*
  * ============================================================
- * TIMING CONSTANTS — exact schedule requested:
- *
- *   FUTURE PHASE
- *     -> sleep in bulk until T-5s
- *     -> poll every 1s until T-1s
- *     -> poll every 250ms until T-0
- *     -> single Discovery call
+ * RPC
  * ============================================================
  */
-const POLL_1S_WINDOW_MS = 5_000; // switch to 1s polling at T-5s
-const POLL_250MS_WINDOW_MS = 1_000; // switch to 250ms polling at T-1s
-const POLL_1S_INTERVAL_MS = 1_000;
-const POLL_250MS_INTERVAL_MS = 250;
+
+const RPC_TIMEOUT_MS = 5_000;
+const RPC_RETRY_COUNT = 0;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function elapsed(startedAt: number): string {
+  return `${Math.round(performance.now() - startedAt)}ms`;
 }
 
 function log(message: string): void {
@@ -81,107 +111,311 @@ function log(message: string): void {
 
 /*
  * ============================================================
- * PHASE RESOLUTION
+ * RPC CLIENTS
  * ============================================================
  */
 
-function isActive(stage: MintStage, nowSec: number): boolean {
-  if (typeof stage.startTime !== "number" || stage.startTime > nowSec) return false;
-  if (typeof stage.endTime === "number" && stage.endTime <= nowSec) return false;
+function createClients(
+  chain: Chain,
+  rpcUrls: string[],
+): PublicClient[] {
+  return rpcUrls.map((url) =>
+    createPublicClient({
+      chain,
+      transport: http(url, {
+        timeout: RPC_TIMEOUT_MS,
+        retryCount: RPC_RETRY_COUNT,
+      }),
+    }),
+  );
+}
+
+async function raceAny<T>(
+  clients: PublicClient[],
+  fn: (client: PublicClient) => Promise<T>,
+): Promise<T> {
+  if (clients.length === 0) {
+    throw new Error("No RPC clients configured.");
+  }
+
+  try {
+    return await Promise.any(
+      clients.map((client) => fn(client)),
+    );
+  } catch (error) {
+    const messages =
+      error instanceof AggregateError
+        ? error.errors.map((e) =>
+            e instanceof Error ? e.message : String(e),
+          )
+        : [String(error)];
+
+    throw new Error(
+      ["All RPCs failed.", ...messages].join("\n"),
+    );
+  }
+}
+
+/*
+ * ============================================================
+ * PHASE IDENTITY
+ * ============================================================
+ */
+
+function phaseKey(stage: MintStage): string {
+  return [
+    stage.label,
+    stage.startTime ?? 0,
+    stage.endTime ?? 0,
+  ].join("|");
+}
+
+function nowSec(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+function isActive(
+  stage: MintStage,
+  currentSec: number,
+): boolean {
+  if (
+    typeof stage.startTime !== "number" ||
+    stage.startTime <= 0
+  ) {
+    return false;
+  }
+
+  if (stage.startTime > currentSec) {
+    return false;
+  }
+
+  if (
+    typeof stage.endTime === "number" &&
+    stage.endTime <= currentSec
+  ) {
+    return false;
+  }
+
   return true;
 }
 
-function isEligible(stage: MintStage): boolean {
-  // Unknown eligibility is treated as "may be usable"; buildMintTransaction
-  // is the final authority and will reject the wallet if it truly can't mint.
-  return stage.eligible ?? true;
+function isFuture(
+  stage: MintStage,
+  currentSec: number,
+): boolean {
+  return (
+    typeof stage.startTime === "number" &&
+    stage.startTime > currentSec
+  );
 }
 
-export interface ResolvedPhase {
-  stage: MintStage;
-  readyNow: boolean;
+function isExpired(
+  stage: MintStage,
+  currentSec: number,
+): boolean {
+  return (
+    typeof stage.endTime === "number" &&
+    stage.endTime <= currentSec
+  );
 }
 
-/**
- * ACTIVE + ELIGIBLE -> mint immediately.
- * Otherwise -> earliest eligible future phase (wallet will wait for it).
+function sortStages(stages: MintStage[]): MintStage[] {
+  return [...stages].sort((a, b) => {
+    const aStart = a.startTime ?? Number.MAX_SAFE_INTEGER;
+    const bStart = b.startTime ?? Number.MAX_SAFE_INTEGER;
+
+    return aStart - bStart;
+  });
+}
+
+/*
+ * ============================================================
+ * PHASE SELECTION
+ * ============================================================
+ *
+ * IMPORTANT:
+ *
+ * We deliberately DO NOT trust `eligible` here.
+ *
+ * OpenSea /mint is the actual authority.
+ *
+ * `eligible === false` from /drops is not enough to discard
+ * a future phase because the API may expose stage-level data
+ * differently from the mint endpoint.
+ *
+ * ============================================================
  */
-export function resolvePhase(stages: MintStage[]): ResolvedPhase {
-  if (stages.length === 0) {
-    throw new Error("Collection has no mint phases.");
+
+function findNextPhase(
+  stages: MintStage[],
+  skipped: Set<string>,
+): MintStage | undefined {
+  const current = nowSec();
+
+  const usable = sortStages(stages).filter((stage) => {
+    const key = phaseKey(stage);
+
+    if (skipped.has(key)) {
+      return false;
+    }
+
+    if (isExpired(stage, current)) {
+      return false;
+    }
+
+    return true;
+  });
+
+  /*
+   * If one or more phases are currently active, choose the
+   * earliest active one.
+   */
+  const active = usable.find((stage) =>
+    isActive(stage, current),
+  );
+
+  if (active) {
+    return active;
   }
 
-  const nowSec = Math.floor(Date.now() / 1000);
-
-  const activeEligible = stages.find((s) => isActive(s, nowSec) && isEligible(s));
-  if (activeEligible) {
-    return { stage: activeEligible, readyNow: true };
-  }
-
-  const futureEligible = stages
-    .filter((s) => typeof s.startTime === "number" && s.startTime > nowSec && isEligible(s))
-    .sort((a, b) => (a.startTime ?? 0) - (b.startTime ?? 0))[0];
-
-  if (futureEligible) {
-    return { stage: futureEligible, readyNow: false };
-  }
-
-  throw new Error(
-    "Wallet is not eligible for the active phase and no eligible future phase was found.",
+  /*
+   * Otherwise choose the earliest future phase.
+   */
+  return usable.find((stage) =>
+    isFuture(stage, current),
   );
 }
 
 /*
  * ============================================================
- * WAIT / POLL SCHEDULE
+ * ERROR CLASSIFICATION
+ * ============================================================
+ *
+ * OpenSeaClient currently throws:
+ *
+ *   OpenSea API 422: {...}
+ *   OpenSea API 409: {...}
+ *
+ * We classify without changing opensea.ts.
  * ============================================================
  */
 
-export async function waitForPhaseStart(stage: MintStage, rpcUrls: string[]): Promise<void> {
-  const startTime = stage.startTime;
-  if (typeof startTime !== "number" || startTime <= 0) {
-    throw new Error(`Invalid phase startTime: ${String(startTime)}`);
+function errorText(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
   }
 
-  const targetMs = startTime * 1000;
+  return String(error);
+}
 
-  log("");
-  log(`[WAIT] Next phase "${stage.label}" starts at ${new Date(targetMs).toLocaleString()}`);
+function getHttpStatus(error: unknown): number | undefined {
+  const text = errorText(error);
 
-  // Phase 1: bulk sleep until T-5s
-  while (true) {
-    const remaining = targetMs - Date.now();
-    if (remaining <= POLL_1S_WINDOW_MS) break;
-    log(`[WAIT] Sleeping until T-5s (${Math.ceil((remaining - POLL_1S_WINDOW_MS) / 1000)}s)...`);
-    await sleep(remaining - POLL_1S_WINDOW_MS);
+  const match = text.match(
+    /OpenSea API\s+(\d{3})/i,
+  );
+
+  if (!match) {
+    return undefined;
   }
 
-  // Entering the final window: warm up RPC connections now so the TCP/TLS
-  // handshake is already done by the time we broadcast at T-0.
-  warmUp(rpcUrls);
+  return Number(match[1]);
+}
 
-  // Phase 2: poll every 1s until T-1s
-  while (true) {
-    const remaining = targetMs - Date.now();
-    if (remaining <= POLL_250MS_WINDOW_MS) break;
-    log(`[WAIT] T-${Math.ceil(remaining / 1000)}s — polling every 1s`);
-    await sleep(Math.min(POLL_1S_INTERVAL_MS, remaining - POLL_250MS_WINDOW_MS));
-  }
+function is422(error: unknown): boolean {
+  return getHttpStatus(error) === 422;
+}
 
-  // Phase 3: poll every 250ms until phase start
-  while (true) {
-    const remaining = targetMs - Date.now();
-    if (remaining <= 0) break;
-    log(`[WAIT] T-${remaining}ms — polling every 250ms`);
-    await sleep(Math.min(POLL_250MS_INTERVAL_MS, remaining));
-  }
-
-  log("[WAIT] Phase reached. Running discovery...");
+function is409(error: unknown): boolean {
+  return getHttpStatus(error) === 409;
 }
 
 /*
  * ============================================================
- * MINT FLOW
+ * FEE PREPARATION
+ * ============================================================
+ */
+
+type FeeFields =
+  | {
+      maxFeePerGas: bigint;
+      maxPriorityFeePerGas: bigint;
+    }
+  | {
+      gasPrice: bigint;
+    };
+
+function applyBuffer(value: bigint): bigint {
+  return (
+    (value * (100n + BigInt(config.gasBufferPercent))) /
+    100n
+  );
+}
+
+/*
+ * PREP IS DONE ONCE.
+ *
+ * We intentionally do not call this again after 409 / 422.
+ */
+async function prepareFees(
+  clients: PublicClient[],
+): Promise<FeeFields> {
+  /*
+   * Get block + priority + gas price in parallel.
+   *
+   * If EIP-1559 is supported, use baseFee + priority.
+   * Otherwise fall back to legacy gasPrice.
+   */
+  const [block, priority, gasPrice] = await Promise.all([
+    raceAny(clients, (client) =>
+      client.getBlock(),
+    ),
+
+    raceAny(clients, (client) =>
+      client
+        .estimateMaxPriorityFeePerGas()
+        .catch(() => 1n),
+    ).catch(() => 1n),
+
+    raceAny(clients, (client) =>
+      client
+        .getGasPrice()
+        .catch(() => 0n),
+    ).catch(() => 0n),
+  ]);
+
+  if (block.baseFeePerGas != null) {
+    const bufferedBaseFee =
+      applyBuffer(block.baseFeePerGas);
+
+    const safePriority =
+      priority > 0n ? priority : 1n;
+
+    const bufferedPriority =
+      applyBuffer(safePriority);
+
+    return {
+      maxFeePerGas:
+        bufferedBaseFee + bufferedPriority,
+      maxPriorityFeePerGas:
+        bufferedPriority,
+    };
+  }
+
+  if (gasPrice <= 0n) {
+    throw new Error(
+      "Unable to determine gas price.",
+    );
+  }
+
+  return {
+    gasPrice: applyBuffer(gasPrice),
+  };
+}
+
+/*
+ * ============================================================
+ * MINT OPTIONS
  * ============================================================
  */
 
@@ -191,7 +425,6 @@ export interface MintOptions {
   wallet: Address;
   quantity: number;
   confirm: boolean;
-  /** Skip estimateGas() and use this value directly (biggest latency win). */
   gasLimit?: bigint;
 }
 
@@ -202,155 +435,991 @@ export interface MintDependencies {
   rpcUrls: string[];
 }
 
-export async function runMint(options: MintOptions, deps: MintDependencies): Promise<void> {
-  const { slug, wallet, quantity, confirm, gasLimit: gasLimitOverride } = options;
-  const { openSea, account, chain, rpcUrls } = deps;
-  const runStartedAt = performance.now();
+/*
+ * ============================================================
+ * MINT PROBE RESULT
+ * ============================================================
+ */
 
-  if (account.address.toLowerCase() !== wallet.toLowerCase()) {
+type ProbeResult =
+  | {
+      type: "success";
+      tx: Awaited<
+        ReturnType<OpenSeaClient["buildMintTransaction"]>
+      >;
+    }
+  | {
+      type: "not-active";
+    }
+  | {
+      type: "not-eligible";
+    };
+
+/*
+ * ============================================================
+ * SINGLE-FLIGHT PROBE
+ * ============================================================
+ *
+ * We never allow overlapping POST /mint requests.
+ *
+ * This prevents:
+ *
+ *   request A
+ *   request B
+ *   request C
+ *   request D
+ *
+ * all racing each other and potentially creating unnecessary
+ * API pressure.
+ * ============================================================
+ */
+
+let probeInFlight = false;
+
+async function probeMint(
+  openSea: OpenSeaClient,
+  slug: string,
+  wallet: Address,
+  quantity: number,
+): Promise<ProbeResult> {
+  /*
+   * This should never normally happen because the caller
+   * serializes probes.
+   */
+  if (probeInFlight) {
+    await sleep(10);
+  }
+
+  probeInFlight = true;
+
+  try {
+    const tx =
+      await openSea.buildMintTransaction(
+        slug,
+        wallet,
+        quantity,
+      );
+
+    return {
+      type: "success",
+      tx,
+    };
+  } catch (error) {
+    if (is409(error)) {
+      return {
+        type: "not-active",
+      };
+    }
+
+    if (is422(error)) {
+      return {
+        type: "not-eligible",
+      };
+    }
+
+    throw error;
+  } finally {
+    probeInFlight = false;
+  }
+}
+
+/*
+ * ============================================================
+ * WAIT UNTIL HOT WINDOW
+ * ============================================================
+ *
+ * NO polling.
+ *
+ * One log only.
+ *
+ * We sleep directly until T-5s.
+ * ============================================================
+ */
+
+async function waitUntilHot(
+  stage: MintStage,
+): Promise<void> {
+  if (
+    typeof stage.startTime !== "number" ||
+    stage.startTime <= 0
+  ) {
+    throw new Error(
+      `Invalid phase startTime: ${String(stage.startTime)}`,
+    );
+  }
+
+  const targetMs =
+    stage.startTime * 1000;
+
+  while (true) {
+    const remaining =
+      targetMs - Date.now();
+
+    if (remaining <= HOT_WINDOW_MS) {
+      return;
+    }
+
+    await sleep(
+      remaining - HOT_WINDOW_MS,
+    );
+  }
+}
+
+/*
+ * ============================================================
+ * AGGRESSIVE HOT PROBE
+ * ============================================================
+ *
+ * We start at T-5s.
+ *
+ * IMPORTANT:
+ *
+ * Before the target phase actually starts:
+ *
+ *   409 -> retry
+ *
+ *   422 -> DO NOT blacklist the target phase.
+ *
+ * Because /mint has no phase argument. At T-5 the endpoint
+ * may still be evaluating the currently active stage.
+ *
+ * Once target phase is ACTIVE:
+ *
+ *   422 -> blacklist ONLY this phase
+ *
+ *   409 -> retry
+ *
+ *   200 -> mint
+ * ============================================================
+ */
+
+async function probeUntilPhaseDecision(
+  stage: MintStage,
+  openSea: OpenSeaClient,
+  slug: string,
+  wallet: Address,
+  quantity: number,
+): Promise<ProbeResult> {
+  const targetMs =
+    (stage.startTime ?? 0) * 1000;
+
+  let hotLogged = false;
+
+  while (true) {
+    const remaining =
+      targetMs - Date.now();
+
+    if (!hotLogged) {
+      log(
+        `[HOT] T-5s — probing "${stage.label}"`,
+      );
+
+      hotLogged = true;
+    }
+
+    const probeStartedAt =
+      performance.now();
+
+    const result =
+      await probeMint(
+        openSea,
+        slug,
+        wallet,
+        quantity,
+      );
+
+    if (result.type === "success") {
+      log(
+        `[PROBE] OK — mint calldata ready (${elapsed(probeStartedAt)})`,
+      );
+
+      return result;
+    }
+
+    const now = Date.now();
+    const activeNow =
+      now >= targetMs;
+
+    /*
+     * --------------------------------------------------------
+     * 422
+     * --------------------------------------------------------
+     *
+     * FUTURE:
+     *   Do NOT skip.
+     *
+     * ACTIVE:
+     *   Skip ONLY this phase.
+     * --------------------------------------------------------
+     */
+    if (result.type === "not-eligible") {
+      if (!activeNow) {
+        /*
+         * The target phase is not active yet.
+         *
+         * This 422 belongs to the currently active drop state,
+         * not necessarily to our target phase.
+         */
+        await sleep(
+          Math.min(
+            PROBE_INTERVAL_NORMAL_MS,
+            Math.max(20, targetMs - Date.now()),
+          ),
+        );
+
+        continue;
+      }
+
+      log(
+        `[PHASE] 422 — wallet NOT eligible for ACTIVE phase "${stage.label}".`,
+      );
+
+      return result;
+    }
+
+    /*
+     * --------------------------------------------------------
+     * 409
+     * --------------------------------------------------------
+     *
+     * Never blacklist.
+     *
+     * Just retry.
+     * --------------------------------------------------------
+     */
+
+    if (result.type === "not-active") {
+      const remainingNow =
+        targetMs - Date.now();
+
+      /*
+       * If still >2s from target:
+       *   500ms interval.
+       */
+      if (remainingNow > 2_000) {
+        await sleep(
+          PROBE_INTERVAL_NORMAL_MS,
+        );
+        continue;
+      }
+
+      /*
+       * T-2s -> T-500ms:
+       *   250ms.
+       */
+      if (remainingNow > 500) {
+        await sleep(
+          PROBE_INTERVAL_FAST_MS,
+        );
+        continue;
+      }
+
+      /*
+       * Final 500ms:
+       *   100ms.
+       *
+       * If already past target, still retry immediately-ish.
+       */
+      await sleep(
+        RETRY_409_MIN_MS,
+      );
+
+      continue;
+    }
+  }
+}
+
+/*
+ * ============================================================
+ * SIGN + BROADCAST
+ * ============================================================
+ */
+
+async function signAndBroadcast(
+  walletClient: ReturnType<typeof createWalletClient>,
+  account: Account,
+  chain: Chain,
+  mintTx: Awaited<
+    ReturnType<OpenSeaClient["buildMintTransaction"]>
+  >,
+  nonce: number,
+  gasLimit: bigint,
+  feeData: FeeFields,
+  rpcUrls: string[],
+): Promise<{
+  hash: `0x${string}`;
+  rpcUrl: string;
+  signMs: number;
+  broadcastMs: number;
+}> {
+  const startedAt =
+    performance.now();
+
+  const signedTx =
+    await walletClient.signTransaction({
+      account,
+      chain,
+      to: mintTx.to,
+      data: mintTx.data,
+      value: mintTx.value,
+      nonce,
+      gas: gasLimit,
+      ...feeData,
+    });
+
+  const signMs =
+    Math.round(
+      performance.now() - startedAt,
+    );
+
+  const broadcastStartedAt =
+    performance.now();
+
+  const result =
+    await broadcastRace(
+      rpcUrls,
+      signedTx,
+    );
+
+  const broadcastMs =
+    Math.round(
+      performance.now() -
+        broadcastStartedAt,
+    );
+
+  return {
+    hash: result.hash,
+    rpcUrl: result.rpcUrl,
+    signMs,
+    broadcastMs,
+  };
+}
+
+/*
+ * ============================================================
+ * MAIN
+ * ============================================================
+ */
+
+export async function runMint(
+  options: MintOptions,
+  deps: MintDependencies,
+): Promise<void> {
+  const {
+    slug,
+    wallet,
+    quantity,
+    confirm,
+    gasLimit: gasLimitOverride,
+  } = options;
+
+  const {
+    openSea,
+    account,
+    chain,
+    rpcUrls,
+  } = deps;
+
+  const runStartedAt =
+    performance.now();
+
+  /*
+   * ----------------------------------------------------------
+   * WALLET CHECK
+   * ----------------------------------------------------------
+   */
+
+  if (
+    account.address.toLowerCase() !==
+    wallet.toLowerCase()
+  ) {
     throw new Error(
       `Wallet mismatch. --wallet ${wallet} does not match PRIVATE_KEY account ${account.address}`,
     );
   }
 
-  const primaryRpc = rpcUrls[0];
-  const clients = createClients(chain, rpcUrls);
-  const walletClient = createWalletClient({
-    account,
-    chain,
-    transport: http(primaryRpc, { timeout: RPC_TIMEOUT_MS, retryCount: RPC_RETRY_COUNT }),
-  });
+  if (rpcUrls.length === 0) {
+    throw new Error(
+      "No RPC endpoints configured.",
+    );
+  }
 
-  // Pre-open TCP/TLS connections to every RPC right away, in parallel with
-  // the OpenSea call below. Costs nothing and removes handshake latency
-  // from the critical path further down.
+  /*
+   * ----------------------------------------------------------
+   * CLIENTS
+   * ----------------------------------------------------------
+   */
+
+  const clients =
+    createClients(
+      chain,
+      rpcUrls,
+    );
+
+  const primaryRpc =
+    rpcUrls[0];
+
+  const walletClient =
+    createWalletClient({
+      account,
+      chain,
+      transport: http(
+        primaryRpc,
+        {
+          timeout:
+            RPC_TIMEOUT_MS,
+          retryCount: 0,
+        },
+      ),
+    });
+
+  /*
+   * Warm connections immediately.
+   *
+   * This is best-effort and does not block.
+   */
   warmUp(rpcUrls);
 
   /*
    * ----------------------------------------------------------
-   * 1. Fetch collection info + phases
+   * 1. FETCH DROP ONCE
    * ----------------------------------------------------------
    */
-  log("[COLLECTION] Fetching drop info + phases...");
-  const drop = await openSea.getDrop(slug);
-  log(`[COLLECTION] ${drop.name ?? slug} — ${drop.stages.length} phase(s) (${elapsed(runStartedAt)})`);
 
-  const resolved = resolvePhase(drop.stages);
+  log(
+    "[COLLECTION] Fetching drop info + phases...",
+  );
 
-  if (resolved.readyNow) {
-    log(`[PHASE] "${resolved.stage.label}" is ACTIVE and wallet is ELIGIBLE — minting now.`);
-  } else {
-    await waitForPhaseStart(resolved.stage, rpcUrls);
+  const collectionStartedAt =
+    performance.now();
+
+  const drop =
+    await openSea.getDrop(
+      slug,
+    );
+
+  log(
+    `[COLLECTION] ${drop.name ?? slug} — ${drop.stages.length} phase(s) (${elapsed(collectionStartedAt)})`,
+  );
+
+  if (
+    drop.stages.length === 0
+  ) {
+    throw new Error(
+      "Collection has no mint phases.",
+    );
   }
 
   /*
    * ----------------------------------------------------------
-   * 2. Discovery (once) + nonce/fee prep IN PARALLEL
-   *    (nonce/fee don't depend on the mint calldata, so we
-   *    fetch them at the same time instead of after)
+   * 2. PREP ONCE
+   * ----------------------------------------------------------
+   *
+   * Nonce + fee are prepared once, in parallel.
+   *
+   * They are NOT repeated after phase changes.
    * ----------------------------------------------------------
    */
-  const criticalPathStartedAt = performance.now();
 
-  const [mintTx, nonce, feeData] = await Promise.all([
-    openSea.buildMintTransaction(slug, wallet, quantity),
-    raceAny(clients, (c) => c.getTransactionCount({ address: wallet, blockTag: "pending" })),
-    prepareFees(clients),
+  const prepStartedAt =
+    performance.now();
+
+  const [
+    nonce,
+    feeData,
+  ] = await Promise.all([
+    raceAny(
+      clients,
+      (client) =>
+        client.getTransactionCount({
+          address: wallet,
+          blockTag: "pending",
+        }),
+    ),
+
+    prepareFees(
+      clients,
+    ),
   ]);
-  log(`[DISCOVERY] OK — mint calldata built. (${elapsed(criticalPathStartedAt)})`);
+
+  const feeLog =
+    "maxFeePerGas" in feeData
+      ? `maxFee=${feeData.maxFeePerGas}`
+      : `gasPrice=${feeData.gasPrice}`;
+
+  log(
+    `[PREP] Nonce=${nonce} ${feeLog} (${elapsed(prepStartedAt)})`,
+  );
 
   /*
    * ----------------------------------------------------------
-   * 3. Gas limit: use override if provided (skips a network
-   *    round-trip), otherwise estimate once.
+   * 3. GAS
+   * ----------------------------------------------------------
+   *
+   * Speed mode strongly prefers a fixed gas limit.
+   *
+   * If no fixed gas was provided, estimate once.
+   *
+   * This is BEFORE FCFS hot window, never during T0.
    * ----------------------------------------------------------
    */
+
   let gasLimit: bigint;
-  if (gasLimitOverride !== undefined) {
-    gasLimit = gasLimitOverride;
-    log(`[GAS] Using fixed gas limit (no estimateGas round-trip): ${gasLimit}`);
-  } else {
-    const gasEstimateStartedAt = performance.now();
-    const gasEstimate = await raceAny(clients, (c) =>
-      c.estimateGas({ account: wallet, to: mintTx.to, data: mintTx.data, value: mintTx.value }),
-    );
-    gasLimit = applyBuffer(gasEstimate);
+
+  if (
+    gasLimitOverride !== undefined
+  ) {
+    gasLimit =
+      gasLimitOverride;
+
     log(
-      `[GAS] Estimate: ${gasEstimate} | Limit (+${config.gasBufferPercent}%): ${gasLimit} ` +
-        `(${elapsed(gasEstimateStartedAt)} — pass --gas-limit next time to skip this call)`,
+      `[GAS] Fixed: ${gasLimit} (estimateGas skipped)`,
+    );
+  } else {
+    /*
+     * We need calldata for estimateGas.
+     *
+     * This is the slow fallback path.
+     *
+     * For maximum FCFS speed, always use:
+     *
+     *   --gas-limit <value>
+     */
+    log(
+      "[GAS] No fixed gas-limit supplied — preparing one estimate before FCFS.",
+    );
+
+    /*
+     * We cannot safely estimate without mint calldata.
+     *
+     * Probe once now.
+     */
+    const estimateStartedAt =
+      performance.now();
+
+    const estimateTx =
+      await openSea.buildMintTransaction(
+        slug,
+        wallet,
+        quantity,
+      );
+
+    const estimate =
+      await raceAny(
+        clients,
+        (client) =>
+          client.estimateGas({
+            account: wallet,
+            to: estimateTx.to,
+            data: estimateTx.data,
+            value: estimateTx.value,
+          }),
+      );
+
+    gasLimit =
+      applyBuffer(estimate);
+
+    log(
+      `[GAS] Estimate=${estimate} Limit=${gasLimit} (+${config.gasBufferPercent}%) (${elapsed(estimateStartedAt)})`,
     );
   }
 
-  log(`[TX] Nonce: ${nonce}`);
+  /*
+   * ----------------------------------------------------------
+   * DRY RUN
+   * ----------------------------------------------------------
+   */
 
   if (!confirm) {
     log("");
-    log("DRY RUN — transaction NOT broadcast. Use --confirm to broadcast.");
-    log(`Tip: re-run with --gas-limit ${gasLimit} to skip the estimateGas round-trip next time.`);
+    log(
+      "DRY RUN — transaction NOT broadcast.",
+    );
+
+    log(
+      `Tip: use --gas-limit ${gasLimit} --confirm for maximum FCFS speed.`,
+    );
+
     return;
   }
 
   /*
    * ----------------------------------------------------------
-   * 4. Sign locally, then race-broadcast to all RPCs
+   * 4. PHASE STATE MACHINE
    * ----------------------------------------------------------
    */
-  const broadcastStartedAt = performance.now();
 
-  const signedTx = await walletClient.signTransaction({
-    account,
-    chain,
-    to: mintTx.to,
-    data: mintTx.data,
-    value: mintTx.value,
-    nonce,
-    gas: gasLimit,
-    ...feeData,
-  });
-  const signedAt = performance.now();
+  const skipped =
+    new Set<string>();
 
-  const result = await broadcastRace(rpcUrls, signedTx);
+  while (true) {
+    const stage =
+      findNextPhase(
+        drop.stages,
+        skipped,
+      );
 
-  log("");
-  log("[SUCCESS] Mint transaction broadcast.");
-  log(`TX          : ${result.hash}`);
-  log(`RPC won     : ${result.rpcUrl}`);
-  log(`Sign time   : ${Math.round(signedAt - broadcastStartedAt)}ms`);
-  log(`Broadcast   : ${Math.round(performance.now() - signedAt)}ms`);
-  log(`Critical path total (discovery -> broadcast): ${elapsed(criticalPathStartedAt)}`);
+    if (!stage) {
+      throw new Error(
+        "No remaining mint phase is available.",
+      );
+    }
+
+    const key =
+      phaseKey(stage);
+
+    const current =
+      nowSec();
+
+    /*
+     * --------------------------------------------------------
+     * ACTIVE
+     * --------------------------------------------------------
+     */
+
+    if (
+      isActive(
+        stage,
+        current,
+      )
+    ) {
+      log(
+        `[PHASE] "${stage.label}" is ACTIVE.`,
+      );
+
+      /*
+       * We are already active.
+       *
+       * Probe immediately.
+       */
+      const result =
+        await probeMint(
+          openSea,
+          slug,
+          wallet,
+          quantity,
+        );
+
+      if (
+        result.type ===
+        "success"
+      ) {
+        log(
+          `[PROBE] ACTIVE phase accepted mint calldata.`,
+        );
+
+        /*
+         * T0 starts here.
+         */
+        const t0StartedAt =
+          performance.now();
+
+        log(
+          "[FCFS] Active mint confirmed — signing and broadcasting immediately.",
+        );
+
+        const broadcast =
+          await signAndBroadcast(
+            walletClient,
+            account,
+            chain,
+            result.tx,
+            nonce,
+            gasLimit,
+            feeData,
+            rpcUrls,
+          );
+
+        log("");
+        log(
+          "[SUCCESS] Mint transaction broadcast.",
+        );
+        log(
+          `TX          : ${broadcast.hash}`,
+        );
+        log(
+          `RPC won     : ${broadcast.rpcUrl}`,
+        );
+        log(
+          `Sign        : ${broadcast.signMs}ms`,
+        );
+        log(
+          `Broadcast   : ${broadcast.broadcastMs}ms`,
+        );
+        log(
+          `T0 total    : ${Math.round(
+            performance.now() -
+              t0StartedAt,
+          )}ms`,
+        );
+
+        return;
+      }
+
+      /*
+       * ACTIVE + 422
+       *
+       * Skip ONLY this active phase.
+       */
+      if (
+        result.type ===
+        "not-eligible"
+      ) {
+        skipped.add(key);
+
+        log(
+          `[PHASE] Skipping ACTIVE phase only: ${key}`,
+        );
+
+        continue;
+      }
+
+      /*
+       * ACTIVE + 409
+       *
+       * It can happen during a transition.
+       *
+       * Do NOT skip.
+       *
+       * Enter aggressive probe loop using the same stage.
+       */
+      if (
+        result.type ===
+        "not-active"
+      ) {
+        const hotResult =
+          await probeUntilPhaseDecision(
+            stage,
+            openSea,
+            slug,
+            wallet,
+            quantity,
+          );
+
+        if (
+          hotResult.type ===
+          "success"
+        ) {
+          const t0StartedAt =
+            performance.now();
+
+          log(
+            "[FCFS] Mint calldata accepted — signing and broadcasting immediately.",
+          );
+
+          const broadcast =
+            await signAndBroadcast(
+              walletClient,
+              account,
+              chain,
+              hotResult.tx,
+              nonce,
+              gasLimit,
+              feeData,
+              rpcUrls,
+            );
+
+          log("");
+          log(
+            "[SUCCESS] Mint transaction broadcast.",
+          );
+          log(
+            `TX          : ${broadcast.hash}`,
+          );
+          log(
+            `RPC won     : ${broadcast.rpcUrl}`,
+          );
+          log(
+            `Sign        : ${broadcast.signMs}ms`,
+          );
+          log(
+            `Broadcast   : ${broadcast.broadcastMs}ms`,
+          );
+          log(
+            `T0 total    : ${Math.round(
+              performance.now() -
+                t0StartedAt,
+            )}ms`,
+          );
+
+          return;
+        }
+
+        /*
+         * If it became active and returned 422,
+         * skip ONLY this phase.
+         */
+        skipped.add(key);
+
+        log(
+          `[PHASE] Skipping ACTIVE phase only: ${key}`,
+        );
+
+        continue;
+      }
+    }
+
+    /*
+     * --------------------------------------------------------
+     * FUTURE
+     * --------------------------------------------------------
+     */
+
+    if (
+      isFuture(
+        stage,
+        current,
+      )
+    ) {
+      const startMs =
+        (stage.startTime ?? 0) *
+        1000;
+
+      const remainingSec =
+        Math.max(
+          0,
+          Math.ceil(
+            (startMs -
+              Date.now()) /
+              1000,
+          ),
+        );
+
+      log(
+        `[PHASE] "${stage.label}" is FUTURE — waiting.`,
+      );
+
+      log(
+        `[WAIT] ${stage.label} starts in ${remainingSec}s`,
+      );
+
+      /*
+       * ------------------------------------------------------
+       * Sleep directly until T-5s.
+       * ------------------------------------------------------
+       */
+
+      await waitUntilHot(
+        stage,
+      );
+
+      /*
+       * Warm all RPC connections during hot window.
+       */
+      warmUp(rpcUrls);
+
+      /*
+       * ------------------------------------------------------
+       * Aggressive probe.
+       * ------------------------------------------------------
+       */
+
+      const result =
+        await probeUntilPhaseDecision(
+          stage,
+          openSea,
+          slug,
+          wallet,
+          quantity,
+        );
+
+      /*
+       * ------------------------------------------------------
+       * SUCCESS
+       * ------------------------------------------------------
+       */
+
+      if (
+        result.type ===
+        "success"
+      ) {
+        const t0StartedAt =
+          performance.now();
+
+        log(
+          "[FCFS] Mint calldata accepted — signing and broadcasting immediately.",
+        );
+
+        const broadcast =
+          await signAndBroadcast(
+            walletClient,
+            account,
+            chain,
+            result.tx,
+            nonce,
+            gasLimit,
+            feeData,
+            rpcUrls,
+          );
+
+        log("");
+        log(
+          "[SUCCESS] Mint transaction broadcast.",
+        );
+        log(
+          `TX          : ${broadcast.hash}`,
+        );
+        log(
+          `RPC won     : ${broadcast.rpcUrl}`,
+        );
+        log(
+          `Sign        : ${broadcast.signMs}ms`,
+        );
+        log(
+          `Broadcast   : ${broadcast.broadcastMs}ms`,
+        );
+        log(
+          `T0 total    : ${Math.round(
+            performance.now() -
+              t0StartedAt,
+          )}ms`,
+        );
+
+        return;
+      }
+
+      /*
+       * ------------------------------------------------------
+       * 422 AFTER TARGET PHASE IS ACTIVE
+       *
+       * This is now a legitimate eligibility failure for
+       * this phase.
+       * ------------------------------------------------------
+       */
+
+      if (
+        result.type ===
+        "not-eligible"
+      ) {
+        skipped.add(key);
+
+        log(
+          `[PHASE] Skipping ACTIVE phase only: ${key}`,
+        );
+
+        continue;
+      }
+
+      /*
+       * A 409 loop normally doesn't return.
+       *
+       * If it somehow does, simply retry same phase.
+       */
+      continue;
+    }
+
+    /*
+     * --------------------------------------------------------
+     * EXPIRED / UNKNOWN
+     * --------------------------------------------------------
+     */
+
+    skipped.add(key);
+  }
 }
 
 /*
  * ============================================================
- * FEE PREP
+ * END
  * ============================================================
  */
-
-type FeeFields =
-  | { maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }
-  | { gasPrice: bigint };
-
-function applyBuffer(value: bigint): bigint {
-  return (value * (100n + config.gasBufferPercent)) / 100n;
-}
-
-async function prepareFees(clients: PublicClient[]): Promise<FeeFields> {
-  // All three are independent RPC calls — fire them together, each raced
-  // across every configured RPC, then pick whichever fee model applies.
-  const [block, priority, gasPrice] = await Promise.all([
-    raceAny(clients, (c) => c.getBlock()),
-    raceAny(clients, (c) => c.estimateMaxPriorityFeePerGas()).catch(() => 1n),
-    raceAny(clients, (c) => c.getGasPrice()).catch(() => 0n),
-  ]);
-
-  if (block.baseFeePerGas != null) {
-    const bufferedBaseFee = applyBuffer(block.baseFeePerGas);
-    const bufferedPriority = applyBuffer(priority > 0n ? priority : 1n);
-    return {
-      maxFeePerGas: bufferedBaseFee + bufferedPriority,
-      maxPriorityFeePerGas: bufferedPriority,
-    };
-  }
-
-  return { gasPrice: applyBuffer(gasPrice) };
-}
