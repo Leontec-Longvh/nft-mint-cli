@@ -1,0 +1,15 @@
+# Node modules and build output
+node_modules/
+dist/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Ignored config containing sensitive wallet info
+config/wallets.json
+
+# Logs and coverage
+*.log
+coverage/
