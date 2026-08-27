@@ -2,14 +2,10 @@ import {
   type Account,
   type Address,
   type Chain,
-  type PublicClient,
-  createPublicClient,
-  createWalletClient,
-  http,
 } from "viem";
 
 import { OpenSeaClient, type MintStage } from "./opensea.js";
-import { broadcastRace, warmUp } from "./broadcast.js";
+import { broadcastRace, warmUp, rpcCallRace } from "./broadcast.js";
 import { config } from "./config.js";
 
 /*
@@ -111,49 +107,16 @@ function log(message: string): void {
 
 /*
  * ============================================================
- * RPC CLIENTS
+ * HEX HELPERS (for raw JSON-RPC params)
  * ============================================================
  */
 
-function createClients(
-  chain: Chain,
-  rpcUrls: string[],
-): PublicClient[] {
-  return rpcUrls.map((url) =>
-    createPublicClient({
-      chain,
-      transport: http(url, {
-        timeout: RPC_TIMEOUT_MS,
-        retryCount: RPC_RETRY_COUNT,
-      }),
-    }),
-  );
+function toHexQuantity(value: bigint): `0x${string}` {
+  return `0x${value.toString(16)}`;
 }
 
-async function raceAny<T>(
-  clients: PublicClient[],
-  fn: (client: PublicClient) => Promise<T>,
-): Promise<T> {
-  if (clients.length === 0) {
-    throw new Error("No RPC clients configured.");
-  }
-
-  try {
-    return await Promise.any(
-      clients.map((client) => fn(client)),
-    );
-  } catch (error) {
-    const messages =
-      error instanceof AggregateError
-        ? error.errors.map((e) =>
-            e instanceof Error ? e.message : String(e),
-          )
-        : [String(error)];
-
-    throw new Error(
-      ["All RPCs failed.", ...messages].join("\n"),
-    );
-  }
+function fromHexQuantity(hex: string): bigint {
+  return BigInt(hex);
 }
 
 /*
@@ -356,37 +319,31 @@ function applyBuffer(value: bigint): bigint {
  * PREP IS DONE ONCE.
  *
  * We intentionally do not call this again after 409 / 422.
+ *
+ * All three calls go through the SAME warmed, keep-alive
+ * connection pool as the final broadcast (see broadcast.ts) —
+ * not viem's separate fetch-based client.
  */
 async function prepareFees(
-  clients: PublicClient[],
+  rpcUrls: string[],
 ): Promise<FeeFields> {
-  /*
-   * Get block + priority + gas price in parallel.
-   *
-   * If EIP-1559 is supported, use baseFee + priority.
-   * Otherwise fall back to legacy gasPrice.
-   */
   const [block, priority, gasPrice] = await Promise.all([
-    raceAny(clients, (client) =>
-      client.getBlock(),
-    ),
+    rpcCallRace<{ baseFeePerGas?: string }>(rpcUrls, "eth_getBlockByNumber", ["latest", false]),
 
-    raceAny(clients, (client) =>
-      client
-        .estimateMaxPriorityFeePerGas()
-        .catch(() => 1n),
-    ).catch(() => 1n),
+    rpcCallRace<string>(rpcUrls, "eth_maxPriorityFeePerGas", [])
+      .then(fromHexQuantity)
+      .catch(() => 1n),
 
-    raceAny(clients, (client) =>
-      client
-        .getGasPrice()
-        .catch(() => 0n),
-    ).catch(() => 0n),
+    rpcCallRace<string>(rpcUrls, "eth_gasPrice", [])
+      .then(fromHexQuantity)
+      .catch(() => 0n),
   ]);
 
-  if (block.baseFeePerGas != null) {
+  const baseFeePerGas = block.baseFeePerGas ? fromHexQuantity(block.baseFeePerGas) : undefined;
+
+  if (baseFeePerGas != null) {
     const bufferedBaseFee =
-      applyBuffer(block.baseFeePerGas);
+      applyBuffer(baseFeePerGas);
 
     const safePriority =
       priority > 0n ? priority : 1n;
@@ -733,10 +690,20 @@ async function probeUntilPhaseDecision(
  * ============================================================
  * SIGN + BROADCAST
  * ============================================================
+ *
+ * IMPORTANT: we call account.signTransaction() directly instead
+ * of viem's walletClient.signTransaction(). The walletClient
+ * wrapper makes a HIDDEN eth_chainId RPC call every single time
+ * it's used — even for a local private-key account that never
+ * needs to ask the network what chain it's on, since we already
+ * know chain.id. That hidden round-trip (on top of being
+ * unnecessary) goes through an entirely different, unwarmed
+ * connection than the one broadcast.ts keeps warm — the single
+ * biggest source of remaining latency in earlier runs.
+ * ============================================================
  */
 
 async function signAndBroadcast(
-  walletClient: ReturnType<typeof createWalletClient>,
   account: Account,
   chain: Chain,
   mintTx: Awaited<
@@ -752,18 +719,23 @@ async function signAndBroadcast(
   signMs: number;
   broadcastMs: number;
 }> {
+  if (!account.signTransaction) {
+    throw new Error(
+      "Account has no local signTransaction — expected a privateKeyToAccount() local account.",
+    );
+  }
+
   const startedAt =
     performance.now();
 
   const signedTx =
-    await walletClient.signTransaction({
-      account,
-      chain,
+    await account.signTransaction({
       to: mintTx.to,
       data: mintTx.data,
       value: mintTx.value,
       nonce,
       gas: gasLimit,
+      chainId: chain.id,
       ...feeData,
     });
 
@@ -845,35 +817,6 @@ export async function runMint(
   }
 
   /*
-   * ----------------------------------------------------------
-   * CLIENTS
-   * ----------------------------------------------------------
-   */
-
-  const clients =
-    createClients(
-      chain,
-      rpcUrls,
-    );
-
-  const primaryRpc =
-    rpcUrls[0];
-
-  const walletClient =
-    createWalletClient({
-      account,
-      chain,
-      transport: http(
-        primaryRpc,
-        {
-          timeout:
-            RPC_TIMEOUT_MS,
-          retryCount: 0,
-        },
-      ),
-    });
-
-  /*
    * Warm connections immediately.
    *
    * This is best-effort and does not block.
@@ -928,17 +871,14 @@ export async function runMint(
     nonce,
     feeData,
   ] = await Promise.all([
-    raceAny(
-      clients,
-      (client) =>
-        client.getTransactionCount({
-          address: wallet,
-          blockTag: "pending",
-        }),
-    ),
+    rpcCallRace<string>(
+      rpcUrls,
+      "eth_getTransactionCount",
+      [wallet, "pending"],
+    ).then((hex) => Number(fromHexQuantity(hex))),
 
     prepareFees(
-      clients,
+      rpcUrls,
     ),
   ]);
 
@@ -1005,16 +945,19 @@ export async function runMint(
       );
 
     const estimate =
-      await raceAny(
-        clients,
-        (client) =>
-          client.estimateGas({
-            account: wallet,
+      await rpcCallRace<string>(
+        rpcUrls,
+        "eth_estimateGas",
+        [
+          {
+            from: wallet,
             to: estimateTx.to,
             data: estimateTx.data,
-            value: estimateTx.value,
-          }),
-      );
+            value: toHexQuantity(estimateTx.value),
+          },
+          "latest",
+        ],
+      ).then(fromHexQuantity);
 
     gasLimit =
       applyBuffer(estimate);
@@ -1120,7 +1063,6 @@ export async function runMint(
 
         const broadcast =
           await signAndBroadcast(
-            walletClient,
             account,
             chain,
             result.tx,
@@ -1209,8 +1151,7 @@ export async function runMint(
 
           const broadcast =
             await signAndBroadcast(
-              walletClient,
-              account,
+            account,
               chain,
               hotResult.tx,
               nonce,
@@ -1342,7 +1283,6 @@ export async function runMint(
 
         const broadcast =
           await signAndBroadcast(
-            walletClient,
             account,
             chain,
             result.tx,

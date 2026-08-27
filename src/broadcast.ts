@@ -266,6 +266,41 @@ export function warmUp(
  * ============================================================
  */
 
+/*
+ * ============================================================
+ * GENERIC RACED JSON-RPC CALL
+ * ============================================================
+ *
+ * Every RPC read in the mint flow (nonce, fee data, gas
+ * estimate) should go through THIS SAME persistent, warmed
+ * connection pool — not viem's separate fetch-based client,
+ * which pays a fresh TCP/TLS handshake every time because it's
+ * a completely different connection pool that warmUp() never
+ * touches.
+ * ============================================================
+ */
+export async function rpcCallRace<T>(
+  rpcUrls: string[],
+  method: string,
+  params: unknown[],
+): Promise<T> {
+  if (rpcUrls.length === 0) {
+    throw new Error("No RPC endpoints configured.");
+  }
+
+  const attempts = rpcUrls.map((url) => rpcRequest<T>(getConnection(url), method, params));
+
+  try {
+    return await Promise.any(attempts);
+  } catch (error) {
+    const messages =
+      error instanceof AggregateError
+        ? error.errors.map((e) => (e instanceof Error ? e.message : String(e)))
+        : [error instanceof Error ? error.message : String(error)];
+    throw new Error([`All RPCs failed for ${method}.`, ...messages].join("\n"));
+  }
+}
+
 export async function rpcGetTransactionCount(
   rpcUrls: string[],
   address: string,
