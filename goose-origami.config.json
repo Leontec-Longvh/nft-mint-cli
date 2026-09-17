@@ -1,0 +1,25 @@
+{
+  "slug": "goose-origami",
+  "chainId": 4663,
+  "contractAddress": "0xb20a41123aff3d692636c00453d406a7643557c7",
+  "wallet": "0x71016560b59d3982E665458DB55484b285af2bB8",
+  "quantity": 1,
+  "stages": [
+    {
+      "label": "Public stage",
+      "startTime": 1788766500,
+      "endTime": 1788777300
+    },
+    {
+      "label": "Team",
+      "startTime": 1788762600,
+      "endTime": 1788762900
+    },
+    {
+      "label": "Allowlist",
+      "startTime": 1788762900,
+      "endTime": 1788766500
+    }
+  ],
+  "preparedAt": "2026-09-07T06:40:59.152Z"
+}

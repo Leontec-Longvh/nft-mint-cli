@@ -30,6 +30,15 @@ const ink = {
   },
 } as const satisfies Chain;
 
+const arc = {
+  id: 5042,
+  name: "Arc",
+  nativeCurrency: { name: "USD Coin", symbol: "USDC", decimals: 18 },
+  rpcUrls: {
+    default: { http: ["https://rpc.mainnet.arc.io"] },
+  },
+} as const satisfies Chain;
+
 interface ChainEntry {
   chain: Chain;
   /** Public RPC endpoints, raced in parallel at broadcast time. */
@@ -45,6 +54,7 @@ export const CHAINS: Record<string, ChainEntry> = {
   zora: { chain: zora, rpcUrls: ["https://zora-rpc.publicnode.com"] },
   robinhood: { chain: robinhood, rpcUrls: ["https://rpc.mainnet.chain.robinhood.com"] },
   ink: { chain: ink, rpcUrls: ["https://rpc-gel.inkonchain.com"] },
+  arc: { chain: arc, rpcUrls: ["https://rpc.mainnet.arc.io"] },
 };
 
 export function resolveChain(chainId: number): ChainEntry {
