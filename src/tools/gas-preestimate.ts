@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 /*
@@ -272,6 +272,246 @@ function errorMessage(error: unknown): string {
   }
 
   return String(error);
+}
+
+/*
+ * ============================================================
+ * AUTO-PROBE — DISCOVER A REAL, CURRENTLY-ELIGIBLE MINTER
+ * ============================================================
+ *
+ * PROBLEM
+ * -------
+ * If --wallet is not eligible for the currently active phase,
+ * OpenSea /mint returns 422 and we have no calldata to run
+ * eth_estimateGas against.
+ *
+ * FIX
+ * ---
+ * OpenSea's public events endpoint lists recent on-chain "mint"
+ * events for a collection, including the buyer address. Those
+ * addresses are, by definition, real wallets that WERE eligible
+ * and successfully minted moments ago.
+ *
+ * We ask OpenSea to build mint calldata for one of THOSE wallets
+ * instead (buildMintTransaction's `minter` param accepts any
+ * address — no private key needed, this never signs anything),
+ * then estimateGas against that real, live calldata.
+ *
+ * This is strictly read-only simulation. It never signs or
+ * broadcasts a transaction for --wallet or for the probed
+ * address.
+ * ============================================================
+ */
+
+interface RecentMintEvent {
+  event_type?: string;
+  transaction?: string;
+  buyer?: string;
+  to_address?: string;
+  from_address?: string;
+  nft?: { owner?: string };
+}
+
+interface MinterCandidate {
+  address: Address;
+  transaction?: string;
+}
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+function extractMinterAddress(event: RecentMintEvent): string | undefined {
+  // Different OpenSea event shapes put the recipient in different
+  // fields. `buyer` is documented as sale-only; mint events come
+  // through as a transfer-shaped object (mint == transfer FROM the
+  // zero address), so `to_address` is the one that actually has
+  // data for event_type "mint". We check all plausible fields so
+  // this keeps working even if OpenSea's shape shifts slightly.
+  return event.to_address ?? event.buyer ?? event.nft?.owner;
+}
+
+/**
+ * A 422 can mean two very different things:
+ *
+ *  - "wallet is not eligible for X" -> THIS candidate wallet isn't
+ *    right for this phase, try the next candidate.
+ *  - "fully minted out" / "sold out" -> the PHASE ITSELF has no
+ *    supply left, for anyone. Trying more candidates against the
+ *    same phase is pointless and just burns OpenSea rate limit.
+ */
+function isPhaseExhaustedError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes("fully minted out") || lower.includes("sold out");
+}
+
+async function fetchRecentMinters(
+  apiKey: string,
+  slug: string,
+  excludeWallet: Address,
+  limit = 20,
+): Promise<MinterCandidate[]> {
+  const url =
+    `https://api.opensea.io/api/v2/events/collection/${encodeURIComponent(slug)}` +
+    `?event_type=mint&limit=${limit}`;
+
+  let response: Response;
+
+  try {
+    response = await fetch(url, {
+      headers: {
+        accept: "application/json",
+        "x-api-key": apiKey,
+      },
+    });
+  } catch (error) {
+    console.log(
+      `[AUTO-PROBE] Could not reach OpenSea events endpoint: ${errorMessage(error)}`,
+    );
+    return [];
+  }
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    console.log(
+      `[AUTO-PROBE] OpenSea events endpoint returned ${response.status}: ${body}`,
+    );
+    return [];
+  }
+
+  let parsed: { asset_events?: RecentMintEvent[] };
+
+  try {
+    parsed = (await response.json()) as { asset_events?: RecentMintEvent[] };
+  } catch {
+    console.log("[AUTO-PROBE] Could not parse OpenSea events response.");
+    return [];
+  }
+
+  const events = parsed.asset_events ?? [];
+
+  console.log(
+    `[AUTO-PROBE] OpenSea returned ${events.length} raw mint event(s).`,
+  );
+
+  const seen = new Set<string>();
+  const candidates: MinterCandidate[] = [];
+
+  for (const event of events) {
+    const candidate = extractMinterAddress(event);
+
+    if (!candidate || !/^0x[a-fA-F0-9]{40}$/.test(candidate)) {
+      continue;
+    }
+
+    const normalized = candidate.toLowerCase();
+
+    if (normalized === ZERO_ADDRESS) {
+      continue;
+    }
+
+    if (normalized === excludeWallet.toLowerCase()) {
+      continue;
+    }
+
+    if (seen.has(normalized)) {
+      continue;
+    }
+
+    seen.add(normalized);
+
+    candidates.push({
+      address: candidate as Address,
+      transaction:
+        event.transaction && /^0x[a-fA-F0-9]{64}$/.test(event.transaction)
+          ? event.transaction
+          : undefined,
+    });
+  }
+
+  if (events.length > 0 && candidates.length === 0) {
+    console.log(
+      "[AUTO-PROBE] Got events but could not extract any address " +
+        "(unexpected event shape — see raw event below).",
+    );
+    console.log(
+      `[AUTO-PROBE] Raw sample: ${JSON.stringify(events[0])}`,
+    );
+  }
+
+  return candidates;
+}
+
+/*
+ * ============================================================
+ * AUTO-SAVE GAS LIMIT INTO <slug>.config.json
+ * ============================================================
+ *
+ * If a config file for this slug already exists (written by
+ * tools/mint-preset.ts, or by hand), update its `gasLimit` field
+ * so a later:
+ *
+ *   npx tsx src/mint-preset.ts <slug> --confirm
+ *
+ * automatically uses this recommendation — no need to also type
+ * --gas-limit every time.
+ *
+ * Does NOT create a new config file if one doesn't exist yet —
+ * only ever updates one that's already there. Does not touch any
+ * other field (stages, contractAddress, preparedAt, etc.).
+ *
+ * An explicit --gas-limit passed on the mint-preset.ts command
+ * line still wins over this, since applyOverrides() there runs
+ * after loading the config file.
+ * ============================================================
+ */
+
+function saveGasLimitToConfig(slug: string, gasLimit: bigint): void {
+  const configPath = path.join(process.cwd(), `${slug}.config.json`);
+
+  if (!existsSync(configPath)) {
+    console.log(
+      `[CONFIG] No ${slug}.config.json found — skipping auto-save ` +
+        "(run tools/mint-preset.ts first if you want this persisted).",
+    );
+    return;
+  }
+
+  let existing: Record<string, unknown>;
+
+  try {
+    existing = JSON.parse(readFileSync(configPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+  } catch (error) {
+    console.log(
+      `[CONFIG] Could not read/parse ${slug}.config.json — ` +
+        `skipping auto-save: ${errorMessage(error)}`,
+    );
+    return;
+  }
+
+  const previous = existing.gasLimit;
+  const updated = { ...existing, gasLimit: Number(gasLimit) };
+
+  try {
+    writeFileSync(configPath, `${JSON.stringify(updated, null, 2)}\n`, "utf8");
+  } catch (error) {
+    console.log(
+      `[CONFIG] Could not write ${slug}.config.json — ` +
+        `skipping auto-save: ${errorMessage(error)}`,
+    );
+    return;
+  }
+
+  console.log(
+    previous === undefined
+      ? `[CONFIG] Saved gasLimit=${gasLimit} into ${slug}.config.json`
+      : `[CONFIG] Updated gasLimit: ${previous} -> ${gasLimit} in ${slug}.config.json`,
+  );
+  console.log(
+    `[CONFIG] "npx tsx src/mint-preset.ts ${slug} --confirm" will now use it ` +
+      "automatically (an explicit --gas-limit on that command still wins).",
+  );
 }
 
 /*
@@ -903,6 +1143,7 @@ async function main(): Promise<void> {
     | undefined;
 
   let successfulStage: MintStage | undefined;
+  let usedAutoProbe = false;
 
   for (const stage of activeStages) {
     console.log("");
@@ -1013,110 +1254,245 @@ async function main(): Promise<void> {
 
     /*
      * ----------------------------------------------------------
-     * HISTORICAL FALLBACK
+     * AUTO-PROBE FALLBACK
      * ----------------------------------------------------------
      *
-     * This path is ONLY for gas planning.
-     *
-     * It deliberately does not create a transaction object for
-     * the current wallet and never calls a wallet/signer.
+     * Try to find a real, currently-eligible wallet via OpenSea's
+     * events feed and borrow ITS live calldata purely to measure
+     * gas. Never signs or broadcasts anything for that wallet.
      * ----------------------------------------------------------
      */
 
-    const references = loadHistoricalReferences(options.slug);
+    console.log("");
+    console.log(
+      "[AUTO-PROBE] Looking up recent real minters on this collection...",
+    );
 
-    if (references.length === 0) {
+    const recentMinters = await fetchRecentMinters(
+      config.openSeaApiKey,
+      options.slug,
+      wallet,
+    );
+
+    let phaseExhausted = false;
+
+    if (recentMinters.length === 0) {
+      console.log(
+        "[AUTO-PROBE] No recent mint events found (drop may be brand new).",
+      );
+    } else {
+      console.log(
+        `[AUTO-PROBE] Found ${recentMinters.length} candidate address(es).`,
+      );
+
+      outer: for (const candidate of recentMinters) {
+        for (const stage of activeStages) {
+          try {
+            const result = await openSea.buildMintTransaction(
+              options.slug,
+              candidate.address,
+              quantity,
+            );
+
+            mintTx = {
+              to: result.to,
+              data: result.data,
+              value: result.value,
+            };
+
+            successfulStage = stage;
+            usedAutoProbe = true;
+
+            console.log(
+              `[AUTO-PROBE] OK — live calldata via ${candidate.address} for "${stage.label}"`,
+            );
+
+            break outer;
+          } catch (error) {
+            const message = errorMessage(error);
+
+            if (isPhaseExhaustedError(message)) {
+              console.log(
+                `[AUTO-PROBE] "${stage.label}" is fully minted out ` +
+                  "(phase-wide, not wallet-specific) — stopping live probing, " +
+                  "falling back to historical gasUsed instead.",
+              );
+              phaseExhausted = true;
+              break outer;
+            }
+
+            console.log(
+              `[AUTO-PROBE] ${candidate.address} failed on "${stage.label}": ${message}`,
+            );
+          }
+        }
+      }
+    }
+
+    /*
+     * ----------------------------------------------------------
+     * HISTORICAL FALLBACK
+     * ----------------------------------------------------------
+     *
+     * Reached when live probing found no usable calldata — either
+     * no mint events yet, every candidate was ineligible, or the
+     * active phase is fully sold out.
+     *
+     * Sources, combined:
+     *   1. Real transaction hashes from the SAME OpenSea events
+     *      we just fetched (fully automatic, no file needed).
+     *   2. Optional manual ./gas-reference.json, if present.
+     *
+     * This path is ONLY for gas planning. It never creates a
+     * transaction object for the current wallet and never calls
+     * a wallet/signer.
+     * ----------------------------------------------------------
+     */
+
+    if (!mintTx) {
+      const autoReferences: HistoricalReference[] = recentMinters
+        .filter((c) => c.transaction !== undefined)
+        .map((c) => ({ hash: c.transaction }));
+
+      const manualReferences = loadHistoricalReferences(options.slug);
+
+      const references = [...autoReferences, ...manualReferences];
+
+      if (autoReferences.length > 0) {
+        console.log("");
+        console.log(
+          `[FALLBACK] Using ${autoReferences.length} real transaction hash(es) ` +
+            "from the collection's own mint history (auto-detected).",
+        );
+      }
+
+      if (manualReferences.length > 0) {
+        console.log(
+          `[FALLBACK] Plus ${manualReferences.length} manual reference(s) ` +
+            `from ${HISTORICAL_CONFIG_NAME}.`,
+        );
+      }
+
+      if (references.length === 0) {
+        console.log("");
+        console.log(
+          "[FALLBACK] No historical references found (auto or manual).",
+        );
+        console.log(
+          `[FALLBACK] Optional file: ${HISTORICAL_CONFIG_NAME}`,
+        );
+        console.log(
+          '[FALLBACK] Example: {"robominttest":{"transactions":[{"hash":"0x..."}]}}',
+        );
+        console.log("");
+        console.log("[SAFE] No transaction signed.");
+        console.log("[SAFE] No transaction broadcast.");
+        return;
+      }
+
       console.log("");
       console.log(
-        "[FALLBACK] No historical references found.",
+        "[FALLBACK] Reading successful transaction receipts...",
+      );
+
+      const historical = await estimateHistoricalGas(
+        clients,
+        allRpcUrls,
+        references,
+      );
+
+      if (historical.length === 0) {
+        console.log(
+          "[FALLBACK] Could not obtain any successful historical gas reference.",
+        );
+        console.log("[SAFE] No transaction signed.");
+        console.log("[SAFE] No transaction broadcast.");
+        return;
+      }
+
+      const historicalRecommendation =
+        calculateHistoricalRecommendation(
+          historical,
+          safetyPercent,
+          roundTo,
+        );
+
+      console.log("");
+      console.log("========================================");
+      console.log("       HISTORICAL GAS FALLBACK");
+      console.log("========================================");
+
+      for (const result of historical) {
+        console.log(
+          `Reference gasUsed : ${result.gasUsed} ` +
+            `@ ${result.rpcUrl}`,
+        );
+        console.log(
+          `Reference TX      : ${result.hash}`,
+        );
+      }
+
+      console.log(
+        `Highest gasUsed   : ${historicalRecommendation.maxGas}`,
       );
       console.log(
-        `[FALLBACK] Optional file: ${HISTORICAL_CONFIG_NAME}`,
+        `Average gasUsed   : ${historicalRecommendation.averageGas}`,
       );
       console.log(
-        '[FALLBACK] Example: {"robominttest":{"transactions":[{"hash":"0x..."}]}}',
+        `Safety margin     : +${safetyPercent}%`,
+      );
+      console.log(
+        `Recommended limit : ${historicalRecommendation.recommendedGas}`,
+      );
+
+      console.log("========================================");
+      console.log("");
+
+      if (phaseExhausted) {
+        console.log(
+          "[NOTE] The active phase was fully sold out at run time, so this",
+        );
+        console.log(
+          "[NOTE] value comes from REAL gasUsed of past mints on this same",
+        );
+        console.log(
+          "[NOTE] contract — typically a closer estimate than a fresh",
+        );
+        console.log(
+          "[NOTE] simulation would have been anyway.",
+        );
+        console.log("");
+      }
+
+      console.log(
+        "[WARNING] Historical gasUsed is NOT an exact estimate",
+      );
+      console.log(
+        "[WARNING] for this wallet or a not-yet-active phase (e.g. FCFS).",
+      );
+      console.log(
+        "[WARNING] Use it only as a conservative planning value.",
       );
       console.log("");
       console.log("[SAFE] No transaction signed.");
       console.log("[SAFE] No transaction broadcast.");
+      console.log("");
+
+      saveGasLimitToConfig(options.slug, historicalRecommendation.recommendedGas);
+      console.log("");
+
       return;
     }
 
+    /*
+     * mintTx WAS set by auto-probe above — fall through to the
+     * normal "calldata summary" / estimateGas flow below, using
+     * the probed wallet's live calldata.
+     */
     console.log("");
     console.log(
-      `[FALLBACK] Found ${references.length} historical reference(s).`,
+      "[AUTO-PROBE] Continuing with probed calldata for gas estimation.",
     );
-    console.log(
-      "[FALLBACK] Reading successful transaction receipts...",
-    );
-
-    const historical = await estimateHistoricalGas(
-      clients,
-      allRpcUrls,
-      references,
-    );
-
-    if (historical.length === 0) {
-      console.log(
-        "[FALLBACK] Could not obtain any successful historical gas reference.",
-      );
-      console.log("[SAFE] No transaction signed.");
-      console.log("[SAFE] No transaction broadcast.");
-      return;
-    }
-
-    const historicalRecommendation =
-      calculateHistoricalRecommendation(
-        historical,
-        safetyPercent,
-        roundTo,
-      );
-
-    console.log("");
-    console.log("========================================");
-    console.log("       HISTORICAL GAS FALLBACK");
-    console.log("========================================");
-
-    for (const result of historical) {
-      console.log(
-        `Reference gasUsed : ${result.gasUsed} ` +
-          `@ ${result.rpcUrl}`,
-      );
-      console.log(
-        `Reference TX      : ${result.hash}`,
-      );
-    }
-
-    console.log(
-      `Highest gasUsed   : ${historicalRecommendation.maxGas}`,
-    );
-    console.log(
-      `Average gasUsed   : ${historicalRecommendation.averageGas}`,
-    );
-    console.log(
-      `Safety margin     : +${safetyPercent}%`,
-    );
-    console.log(
-      `Recommended limit : ${historicalRecommendation.recommendedGas}`,
-    );
-
-    console.log("========================================");
-    console.log("");
-    console.log(
-      "[WARNING] Historical gasUsed is NOT an exact estimate",
-    );
-    console.log(
-      "[WARNING] for this wallet or the future mint phase.",
-    );
-    console.log(
-      "[WARNING] Use it only as a conservative planning value.",
-    );
-    console.log("");
-    console.log("[SAFE] No transaction signed.");
-    console.log("[SAFE] No transaction broadcast.");
-    console.log("");
-
-    return;
   }
 
   /*
@@ -1137,6 +1513,22 @@ async function main(): Promise<void> {
   console.log(
     `  Phase    : ${successfulStage?.label ?? "unknown"}`,
   );
+
+  if (usedAutoProbe) {
+    console.log("");
+    console.log(
+      "  [NOTE] Calldata came from an auto-discovered minter, not --wallet.",
+    );
+    console.log(
+      "  [NOTE] --wallet was not eligible for the active phase at run time.",
+    );
+    console.log(
+      "  [NOTE] Gas can differ slightly (e.g. allowlist proof length) —",
+    );
+    console.log(
+      "  [NOTE] the +50% safety margin below is intended to absorb that.",
+    );
+  }
 
   /*
    * ----------------------------------------------------------
@@ -1294,6 +1686,10 @@ async function main(): Promise<void> {
   console.log(
     `Use: --gas-limit ${recommendedGas}`,
   );
+
+  console.log("");
+
+  saveGasLimitToConfig(options.slug, recommendedGas);
 
   console.log("");
 

@@ -1,0 +1,36 @@
+{
+  "slug": "arc-tellers",
+  "chainId": 5042,
+  "contractAddress": "0xbbde39d8af5dd4277a131ba4c3d868c7ee599973",
+  "wallet": "0x71016560b59d3982E665458DB55484b285af2bB8",
+  "quantity": 2,
+  "stages": [
+    {
+      "label": "Public stage",
+      "startTime": 1789629218,
+      "endTime": 1789672418
+    },
+    {
+      "label": "THE VAULT",
+      "startTime": 1789601618,
+      "endTime": 1789602218
+    },
+    {
+      "label": "VIP",
+      "startTime": 1789602218,
+      "endTime": 1789604018
+    },
+    {
+      "label": "GTD",
+      "startTime": 1789604018,
+      "endTime": 1789614818
+    },
+    {
+      "label": "FCFS",
+      "startTime": 1789614818,
+      "endTime": 1789629218
+    }
+  ],
+  "preparedAt": "2026-09-17T02:39:49.671Z",
+  "gasLimit": 377000
+}
