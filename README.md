@@ -198,3 +198,68 @@ npx tsx src/mint-preset.ts <slug> --confirm
 `npx`/`npm` được spawn với `process.platform === "win32"` detection +
 `shell: true` để resolve đúng `npx.cmd` — không cần chỉnh gì thêm khi chạy
 trên Windows.
+
+
+---
+
+## 5. `src/tools/send-tokens.ts` — gửi ETH hoặc token ERC-20 cho nhiều ví
+
+Gửi native token hoặc bất kỳ ERC-20 nào cho 1 hoặc nhiều ví, số lượng khác
+nhau theo file config. Không cần biết contract address hay decimals —
+chỉ cần gõ **symbol** ("ETH", "USDT", ...), tool tự tra `tokens.config.json`
+và tự đọc `decimals()` on-chain.
+
+```bash
+npx tsx src/tools/send-tokens.ts --config send.config.json [--dry-run]
+```
+
+Format `send.config.json`:
+
+```json
+{
+  "chainId": 4663,
+  "token": "USDT",
+  "recipients": [
+    { "address": "0x...", "amount": "100" },
+    { "address": "0x...", "amount": "42.5" }
+  ]
+}
+```
+
+Registry symbol → contract address (`tokens.config.json` ở project root, cấu
+hình 1 lần):
+
+```json
+{ "USDT": "0x...", "USDC": "0x..." }
+```
+
+`"token": "ETH"` (hoặc "NATIVE") gửi native currency của chain, không cần
+registry. Dùng `--dry-run` để xem trước, không broadcast.
+
+## 6. `src/tools/nft-sender.ts` — gửi NFT (ERC-721/1155) cho nhiều ví
+
+Gửi các NFT ví đang sở hữu sẵn tới nhiều ví khác nhau (không mint). Hỗ trợ
+cả ERC-721 và ERC-1155.
+
+```bash
+npx tsx src/tools/nft-sender.ts --config nft-send.config.json [--dry-run]
+```
+
+Format `nft-send.config.json`:
+
+```json
+{
+  "chainId": 4663,
+  "nftAddress": "0x...",
+  "tokenType": "ERC721",
+  "transfers": [
+    { "to": "0x...", "tokenId": "101" },
+    { "to": "0x...", "tokenId": "102" }
+  ]
+}
+```
+
+Cả 2 tool dùng chung `PRIVATE_KEY`/`EXTRA_RPC_URLS`/`GAS_BUFFER_PERCENT`
+trong `.env` sẵn có, và cùng hạ tầng (`chains.ts`, `broadcast.ts`) với
+`cli.ts` — không cần cấu hình thêm gì. `--chain-id` trên CLI override được
+`chainId` trong config nếu cần đổi chain tạm thời.
